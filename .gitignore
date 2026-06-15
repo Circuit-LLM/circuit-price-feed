@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Secrets — NEVER commit. Use .env.example as the template.
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Backups / editor cruft
+*.bak
+*.bak_*
+.DS_Store
+*.swp
