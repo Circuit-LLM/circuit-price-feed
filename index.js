@@ -419,7 +419,10 @@ const LOSERS_TTL_MS = 60_000;
 app.get('/losers', async (req, res) => {
   const limit     = Math.min(Math.max(parseInt(req.query.limit ?? '60', 10), 1), 200);
   const minChange = parseFloat(req.query.minChange ?? '-0.1');  // at least this negative (e.g. -0.1)
-  const maxChange = parseFloat(req.query.maxChange ?? '0');      // no more negative than this (e.g. -15 to skip deep drops)
+  // Floor on how far it dropped. Default -100 = no floor (return every dipper). Callers that want
+  // to skip deep drops pass e.g. maxChange=-15. NOTE: the filter is `change1h >= maxChange`, so a
+  // default of 0 made the bare endpoint impossible (change1h <= -0.1 AND >= 0) → always empty.
+  const maxChange = parseFloat(req.query.maxChange ?? '-100');
 
   const now = Date.now();
   if (_losersCache && now - _losersCacheTs < LOSERS_TTL_MS) {
