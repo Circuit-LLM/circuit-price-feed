@@ -414,7 +414,107 @@ const LOSERS_STABLE = new Set([
 
 let _losersCache    = null;
 let _losersCacheTs  = 0;
+let _losersInflight = null;        // single-flight: one SCAN at a time, shared by concurrent refreshers
 const LOSERS_TTL_MS = 60_000;
+
+// The expensive bit — SCAN ~2k Redis keys + a big pipeline + classify. Kept OFF the request path:
+// a background timer refreshes it every 45s and requests serve the (at most ~seconds-stale) cache.
+// Previously this ran inline on a cache miss and could exceed the data-api's 5s proxy timeout → 502.
+async function computeLosers() {
+  const r = await redis.getClient();
+  if (!r) throw new Error('Redis not available');
+  const now = Date.now();
+
+  // ── Source 1: completed 1h OHLCV candles ─────────────────────────────────
+  const candleKeys = [];
+  let cursor = '0';
+  do {
+    const [next, batch] = await r.scan(cursor, 'MATCH', 'circuit:candles:1h:*', 'COUNT', '500');
+    cursor = next;
+    candleKeys.push(...batch);
+  } while (cursor !== '0');
+
+  // ── Source 2: price history ring buffers (wider coverage, ~925 tokens) ───
+  const phKeys = [];
+  cursor = '0';
+  do {
+    const [next, batch] = await r.scan(cursor, 'MATCH', 'circuit:ph:*', 'COUNT', '500');
+    cursor = next;
+    phKeys.push(...batch);
+  } while (cursor !== '0');
+
+  // Pipeline both sources together
+  const pipe = r.pipeline();
+  for (const k of candleKeys) pipe.lrange(k, 0, 0);          // newest closed candle
+  for (const k of phKeys)     pipe.lrange(k, 0, 0);          // newest ph tick
+  for (const k of phKeys)     pipe.lrange(k, -1, -1);        // oldest ph tick (for change)
+  const results = await pipe.exec();
+
+  const seenMints  = new Set();
+  const losers     = [];
+  const STALE_4H   = 4 * 3_600_000;
+  const MIN_SPAN   = 30 * 60_000;   // need at least 30 min of ph history
+  const MAX_SPAN   = 2  * 3_600_000; // reject spans > 2h — not a proxy for 1h change
+  const MIN_CHANGE = -50;            // -50%+ in 1h is noise or a rug, not a dip-reversal candidate
+
+  // Candle-based losers (most accurate — intra-candle open-to-close)
+  for (let i = 0; i < candleKeys.length; i++) {
+    const mint = candleKeys[i].replace('circuit:candles:1h:', '');
+    if (LOSERS_STABLE.has(mint)) continue;
+    const raw  = results[i]?.[1] ?? [];
+    if (!raw.length) continue;
+    try {
+      const c = JSON.parse(raw[0]);
+      if (!c.o || c.o <= 0 || !c.c) continue;
+      if (now - (c.t + 3_600_000) > STALE_4H) continue;
+      const change1h = ((c.c - c.o) / c.o) * 100;
+      if (change1h < 0 && change1h >= MIN_CHANGE) {
+        losers.push({ mint, change1h: parseFloat(change1h.toFixed(4)), src: 'candle' });
+        seenMints.add(mint);
+      }
+    } catch { continue; }
+  }
+
+  // Price-history-based losers (broader coverage — newest vs oldest tick)
+  const phBase = candleKeys.length;
+  for (let i = 0; i < phKeys.length; i++) {
+    const mint = phKeys[i].replace('circuit:ph:', '');
+    if (seenMints.has(mint)) continue;       // already covered by candle source
+    if (LOSERS_STABLE.has(mint)) continue;   // skip infrastructure tokens
+    const newestRaw = results[phBase + i]?.[1]?.[0];
+    const oldestRaw = results[phBase + phKeys.length + i]?.[1]?.[0];
+    if (!newestRaw || !oldestRaw) continue;
+    try {
+      const newest = JSON.parse(newestRaw);
+      const oldest = JSON.parse(oldestRaw);
+      if (!oldest.p || oldest.p <= 0 || !newest.p) continue;
+      const span = newest.ts - oldest.ts;
+      if (span < MIN_SPAN) continue;   // not enough history yet
+      if (span > MAX_SPAN) continue;   // span too wide — oldest tick is >2h old, not a 1h proxy
+      if (now - newest.ts > STALE_4H) continue; // token went quiet
+      const change1h = ((newest.p - oldest.p) / oldest.p) * 100;
+      if (change1h < 0 && change1h >= MIN_CHANGE) {
+        losers.push({ mint, change1h: parseFloat(change1h.toFixed(4)), src: 'ph' });
+        seenMints.add(mint);
+      }
+    } catch { continue; }
+  }
+
+  losers.sort((a, b) => a.change1h - b.change1h);
+  _losersCache   = losers;
+  _losersCacheTs = Date.now();
+  return losers;
+}
+
+// Single-flight refresh — concurrent callers share one in-flight SCAN instead of stacking them.
+function refreshLosers() {
+  if (!_losersInflight) {
+    _losersInflight = computeLosers()
+      .catch((e) => { console.warn('[losers] refresh failed:', e.message); return null; })
+      .finally(() => { _losersInflight = null; });
+  }
+  return _losersInflight;
+}
 
 app.get('/losers', async (req, res) => {
   const limit     = Math.min(Math.max(parseInt(req.query.limit ?? '60', 10), 1), 200);
@@ -424,103 +524,24 @@ app.get('/losers', async (req, res) => {
   // default of 0 made the bare endpoint impossible (change1h <= -0.1 AND >= 0) → always empty.
   const maxChange = parseFloat(req.query.maxChange ?? '-100');
 
-  const now = Date.now();
-  if (_losersCache && now - _losersCacheTs < LOSERS_TTL_MS) {
-    const out = _losersCache
-      .filter(l => l.change1h <= minChange && l.change1h >= maxChange)
-      .slice(0, limit);
-    return res.json({ losers: out, count: out.length, total: _losersCache.length, cached: true });
+  // Serve the cache; only the very first request (cold start) waits on a compute. A stale cache is
+  // returned immediately and refreshed in the background → no request ever blocks on the SCAN.
+  const stale = !_losersCache || Date.now() - _losersCacheTs >= LOSERS_TTL_MS;
+  if (!_losersCache) {
+    await refreshLosers();
+    if (!_losersCache) return res.status(503).json({ error: 'losers warming up — retry shortly' });
+  } else if (stale) {
+    refreshLosers(); // fire-and-forget; serve what we have now
   }
 
-  try {
-    const r = await redis.getClient();
-    if (!r) return res.status(503).json({ error: 'Redis not available' });
-
-    // ── Source 1: completed 1h OHLCV candles ─────────────────────────────────
-    const candleKeys = [];
-    let cursor = '0';
-    do {
-      const [next, batch] = await r.scan(cursor, 'MATCH', 'circuit:candles:1h:*', 'COUNT', '500');
-      cursor = next;
-      candleKeys.push(...batch);
-    } while (cursor !== '0');
-
-    // ── Source 2: price history ring buffers (wider coverage, ~925 tokens) ───
-    const phKeys = [];
-    cursor = '0';
-    do {
-      const [next, batch] = await r.scan(cursor, 'MATCH', 'circuit:ph:*', 'COUNT', '500');
-      cursor = next;
-      phKeys.push(...batch);
-    } while (cursor !== '0');
-
-    // Pipeline both sources together
-    const pipe = r.pipeline();
-    for (const k of candleKeys) pipe.lrange(k, 0, 0);          // newest closed candle
-    for (const k of phKeys)     pipe.lrange(k, 0, 0);          // newest ph tick
-    for (const k of phKeys)     pipe.lrange(k, -1, -1);        // oldest ph tick (for change)
-    const results = await pipe.exec();
-
-    const seenMints  = new Set();
-    const losers     = [];
-    const STALE_4H   = 4 * 3_600_000;
-    const MIN_SPAN   = 30 * 60_000;   // need at least 30 min of ph history
-    const MAX_SPAN   = 2  * 3_600_000; // reject spans > 2h — not a proxy for 1h change
-    const MIN_CHANGE = -50;            // -50%+ in 1h is noise or a rug, not a dip-reversal candidate
-
-    // Candle-based losers (most accurate — intra-candle open-to-close)
-    for (let i = 0; i < candleKeys.length; i++) {
-      const mint = candleKeys[i].replace('circuit:candles:1h:', '');
-      if (LOSERS_STABLE.has(mint)) continue;
-      const raw  = results[i]?.[1] ?? [];
-      if (!raw.length) continue;
-      try {
-        const c = JSON.parse(raw[0]);
-        if (!c.o || c.o <= 0 || !c.c) continue;
-        if (now - (c.t + 3_600_000) > STALE_4H) continue;
-        const change1h = ((c.c - c.o) / c.o) * 100;
-        if (change1h < 0 && change1h >= MIN_CHANGE) {
-          losers.push({ mint, change1h: parseFloat(change1h.toFixed(4)), src: 'candle' });
-          seenMints.add(mint);
-        }
-      } catch { continue; }
-    }
-
-    // Price-history-based losers (broader coverage — newest vs oldest tick)
-    const phBase = candleKeys.length;
-    for (let i = 0; i < phKeys.length; i++) {
-      const mint = phKeys[i].replace('circuit:ph:', '');
-      if (seenMints.has(mint)) continue;       // already covered by candle source
-      if (LOSERS_STABLE.has(mint)) continue;   // skip infrastructure tokens
-      const newestRaw = results[phBase + i]?.[1]?.[0];
-      const oldestRaw = results[phBase + phKeys.length + i]?.[1]?.[0];
-      if (!newestRaw || !oldestRaw) continue;
-      try {
-        const newest = JSON.parse(newestRaw);
-        const oldest = JSON.parse(oldestRaw);
-        if (!oldest.p || oldest.p <= 0 || !newest.p) continue;
-        const span = newest.ts - oldest.ts;
-        if (span < MIN_SPAN) continue;   // not enough history yet
-        if (span > MAX_SPAN) continue;   // span too wide — oldest tick is >2h old, not a 1h proxy
-        if (now - newest.ts > STALE_4H) continue; // token went quiet
-        const change1h = ((newest.p - oldest.p) / oldest.p) * 100;
-        if (change1h < 0 && change1h >= MIN_CHANGE) {
-          losers.push({ mint, change1h: parseFloat(change1h.toFixed(4)), src: 'ph' });
-          seenMints.add(mint);
-        }
-      } catch { continue; }
-    }
-
-    losers.sort((a, b) => a.change1h - b.change1h);
-    _losersCache   = losers;
-    _losersCacheTs = now;
-
-    const out = losers.filter(l => l.change1h <= minChange && l.change1h >= maxChange).slice(0, limit);
-    res.json({ losers: out, count: out.length, total: losers.length, cached: false });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const base = _losersCache || [];
+  const out = base.filter(l => l.change1h <= minChange && l.change1h >= maxChange).slice(0, limit);
+  res.json({ losers: out, count: out.length, total: base.length, cached: !stale });
 });
+
+// Keep the cache warm so requests never wait on the SCAN (refresh at 45s, well inside the 60s TTL).
+setInterval(refreshLosers, 45_000).unref?.();
+setTimeout(refreshLosers, 2_000).unref?.(); // prime shortly after boot
 
 // ── /warm ─────────────────────────────────────────────────────────────────────
 // Pre-populate Redis for a mint that an agent just bought.
