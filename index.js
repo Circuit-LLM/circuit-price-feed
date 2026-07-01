@@ -29,6 +29,7 @@ const redis    = require('./lib/redis');
 const solPrice = require('./lib/sol-price');
 const { resolvePrice, resolvePrices } = require('./lib/prices');
 const { estimateAmmSolOut, estimateAmmTokenOut } = require('./lib/slippage');
+const { resolveSymbols } = require('./lib/metadata');
 
 const PORT      = parseInt(process.env.PORT ?? '18941', 10);
 const startedAt = Date.now();
@@ -405,6 +406,19 @@ async function buildScanCandidates({ limit, minLiquidity, seedMints }) {
       };
     } catch { return null; }
   }))).filter(Boolean);
+
+  // Enrich with real token names (Metaplex metadata, Redis-cached). The reserve feed has no
+  // symbol/name, so candidates default to '?'; without this the agent's scan logs, the dashboard
+  // scanner, and published swarm signals all show '?' or the raw mint. Best-effort — a resolution
+  // miss or RPC blip just leaves the '?' fallback, never fails the scan.
+  try {
+    const names = await resolveSymbols(candidates.map(c => c.mint));
+    for (const c of candidates) {
+      const n = names[c.mint];
+      if (n?.symbol) c.symbol = n.symbol;
+      if (n?.name)   c.name   = n.name;
+    }
+  } catch { /* keep '?' — cosmetic only */ }
 
   return candidates;
 }
