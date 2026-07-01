@@ -16,6 +16,8 @@
 //   GET  /slippage/buy/:mint            — ?solAmount=N — buy-side impact estimate
 //   GET  /history/:mint                 — ?limit=100 — short-term price tick history
 //   GET  /candles/:mint                 — ?window=1m|5m|1h|1d&limit=100 — OHLCV ring buffer
+//   GET  /active?limit=100&minTxns=2    — recently-active token universe (30s cached)
+//   GET  /scan?limit=30&minLiquidity=&seed=m1,m2 — server-side dip-reversal candidate build (one request)
 //   POST /warm                          — {mint} — pre-populate Redis for a freshly bought token
 //   POST /register                      — {mint, poolAccount} — write pool-by-mint reverse index
 'use strict';
@@ -188,63 +190,234 @@ let _activeCacheTs = 0;
 const ACTIVE_TTL_MS  = 30_000;       // recent activity shifts faster than the 60s losers list
 const ACTIVE_STALE_MS = 20 * 60_000; // ignore tokens with no 5m candle in the last 20 min
 
+// Compute (and 30s-cache) the recent-activity token list. Extracted so /active and /scan
+// share one SCAN — the expensive 5m-candle key sweep runs at most once per 30s regardless
+// of which endpoint is hit. Throws 'Redis not available' when the client is down.
+async function getActiveList() {
+  const now = Date.now();
+  if (_activeCache && now - _activeCacheTs < ACTIVE_TTL_MS) return _activeCache;
+
+  const r = await redis.getClient();
+  if (!r) throw new Error('Redis not available');
+
+  // Scan 5m candle keys (~835 tokens) — widest coverage with dense enough txn counts.
+  const keys = [];
+  let cursor = '0';
+  do {
+    const [next, batch] = await r.scan(cursor, 'MATCH', 'circuit:candles:5m:*', 'COUNT', '500');
+    cursor = next;
+    keys.push(...batch);
+  } while (cursor !== '0');
+
+  // Pipeline the newest 3 5m candles per token (~last 15 min of activity).
+  const pipe = r.pipeline();
+  for (const k of keys) pipe.lrange(k, 0, 2);
+  const results = await pipe.exec();
+
+  const active = [];
+  for (let i = 0; i < keys.length; i++) {
+    const mint = keys[i].replace('circuit:candles:5m:', '');
+    if (LOSERS_STABLE.has(mint)) continue;
+    const raw = results[i]?.[1] ?? [];
+    if (!raw.length) continue;
+    let cs;
+    try { cs = raw.map(x => JSON.parse(x)); } catch { continue; }
+    const newest = cs[0];
+    if (!newest || now - newest.t > ACTIVE_STALE_MS) continue;   // gone quiet → skip
+    const recentTxns   = cs.reduce((s, c) => s + (c.b || 0) + (c.s || 0), 0);
+    if (recentTxns < 1) continue;                                // no trades → skip
+    const recentVolSol = cs.reduce((s, c) => s + (c.v || 0), 0);
+    active.push({
+      mint,
+      recentTxns,
+      recentVolSol: parseFloat(recentVolSol.toFixed(4)),
+      ageMin: parseFloat(((now - newest.t) / 60_000).toFixed(1)),
+    });
+  }
+  // Rank by recent txn count, then recent SOL volume.
+  active.sort((a, b) => b.recentTxns - a.recentTxns || b.recentVolSol - a.recentVolSol);
+  _activeCache   = active;
+  _activeCacheTs = now;
+  return active;
+}
+
 app.get('/active', async (req, res) => {
   const limit   = Math.min(Math.max(parseInt(req.query.limit ?? '100', 10), 1), 300);
   const minTxns = Math.max(parseInt(req.query.minTxns ?? '2', 10), 0);
+  const wasCached = !!(_activeCache && Date.now() - _activeCacheTs < ACTIVE_TTL_MS);
+  try {
+    const active = await getActiveList();
+    const out = active.filter(t => t.recentTxns >= minTxns).slice(0, limit);
+    res.json({ tokens: out, count: out.length, total: active.length, solUsd: solPrice.getSolPrice(), cached: wasCached });
+  } catch (err) {
+    res.status(err.message === 'Redis not available' ? 503 : 500).json({ error: err.message });
+  }
+});
 
-  const now = Date.now();
-  if (_activeCache && now - _activeCacheTs < ACTIVE_TTL_MS) {
-    const out = _activeCache.filter(t => t.recentTxns >= minTxns).slice(0, limit);
-    return res.json({ tokens: out, count: out.length, total: _activeCache.length, solUsd: solPrice.getSolPrice(), cached: true });
+// ── /scan?limit=30&minLiquidity=80000&seed=mint1,mint2 ──────────────────────────
+// Server-side dip-reversal candidate builder. Does the whole universe → price → OHLCV
+// enrichment in ONE request, co-located with Redis. This replaces the ~200-request-per-scan
+// per-mint fan-out that circuit-agent used to run client-side (lib/circuit.js scanFree),
+// which only worked for VPS-co-located agents hitting 127.0.0.1:18941 directly — remote
+// agents (running the bot on their own machine) got nothing on localhost:18941, fell back
+// to the paid DexScreener scan every cycle, and never saw the live Geyser feed. Remote
+// agents now reach this via the circuit-data-api /api/price-feed/scan proxy in a single
+// rate-limit-friendly call. Returns candidates in the EXACT shape circuit-agent/lib/scoring.js
+// consumes, so scoring/gates are unchanged vs the old client-side build.
+const SCAN_WSOL = 'So11111111111111111111111111111111111111112';
+
+async function buildScanCandidates({ limit, minLiquidity, seedMints }) {
+  const solUsd = solPrice.getSolPrice() || 150;
+
+  // Universe = RECENTLY-ACTIVE tokens (real trades in the last ~15 min). /trending (cumulative
+  // volume) is the fallback only when /active is empty, so discovery never goes blind.
+  let universeMints = [];
+  try {
+    const active = await getActiveList();
+    universeMints = active.filter(t => t.recentTxns >= 2).map(t => t.mint);
+  } catch { /* fall through to trending */ }
+  if (!universeMints.length) {
+    const trending = await redis.getTrending(50);
+    universeMints = trending.map(t => t.mint).filter(Boolean);
   }
 
-  try {
-    const r = await redis.getClient();
-    if (!r) return res.status(503).json({ error: 'Redis not available' });
+  // seedMints (currently-dipping tokens from the Geyser losers feed) placed FIRST so they are
+  // always evaluated even if they fall outside the active top-N. De-dupe preserving seed-first
+  // order; skip wrapped SOL (quote asset — degenerate self-priced candles).
+  const topMints = [...new Set([
+    ...seedMints.filter(m => m && m !== SCAN_WSOL),
+    ...universeMints.filter(m => m && m !== SCAN_WSOL),
+  ])];
+  if (!topMints.length) return [];
 
-    // Scan 5m candle keys (~835 tokens) — widest coverage with dense enough txn counts.
-    const keys = [];
-    let cursor = '0';
-    do {
-      const [next, batch] = await r.scan(cursor, 'MATCH', 'circuit:candles:5m:*', 'COUNT', '500');
-      cursor = next;
-      keys.push(...batch);
-    } while (cursor !== '0');
+  // Seeds get their own headroom PLUS a full active slice (mirrors the tuned client budget).
+  const scanBudget = Math.min(topMints.length, seedMints.length + limit * 2);
 
-    // Pipeline the newest 3 5m candles per token (~last 15 min of activity).
-    const pipe = r.pipeline();
-    for (const k of keys) pipe.lrange(k, 0, 2);
-    const results = await pipe.exec();
+  // Batch price lookup (solReserve → liquidityUsd; priceSol → scan-time anchor).
+  const priceMap = {};
+  for (let i = 0; i < scanBudget; i += 20) {
+    Object.assign(priceMap, await resolvePrices(topMints.slice(i, i + 20)));
+  }
 
-    const active = [];
-    for (let i = 0; i < keys.length; i++) {
-      const mint = keys[i].replace('circuit:candles:5m:', '');
-      if (LOSERS_STABLE.has(mint)) continue;
-      const raw = results[i]?.[1] ?? [];
-      if (!raw.length) continue;
-      let cs;
-      try { cs = raw.map(x => JSON.parse(x)); } catch { continue; }
-      const newest = cs[0];
-      if (!newest || now - newest.t > ACTIVE_STALE_MS) continue;   // gone quiet → skip
-      const recentTxns   = cs.reduce((s, c) => s + (c.b || 0) + (c.s || 0), 0);
-      if (recentTxns < 1) continue;                                // no trades → skip
-      const recentVolSol = cs.reduce((s, c) => s + (c.v || 0), 0);
-      active.push({
+  const candidates = (await Promise.all(topMints.slice(0, scanBudget).map(async (mint) => {
+    try {
+      const [c5, c1, cd, cm] = await Promise.all([
+        redis.getCandles(mint, '5m', 13),
+        redis.getCandles(mint, '1h', 7),
+        redis.getCandles(mint, '1d', 2),
+        redis.getCandles(mint, '1m', 4),
+      ]);
+      if (!c5.length) return null; // token not yet indexed
+
+      // % change across the last `n` candles of a series (oldest-of-n open → latest close).
+      const pctChange = (arr, n) => {
+        if (!arr.length) return 0;
+        const open  = arr[Math.max(0, arr.length - n)]?.o;
+        const close = arr[arr.length - 1]?.c;
+        return open > 0 ? ((close - open) / open) * 100 : 0;
+      };
+      const sumV = (arr) => arr.reduce((s, c) => s + (c.v ?? 0), 0);
+      const sumB = (arr) => arr.reduce((s, c) => s + (c.b ?? 0), 0);
+      const sumS = (arr) => arr.reduce((s, c) => s + (c.s ?? 0), 0);
+
+      // Recent metrics over the last ~2 5m candles (~10 min) — a true recent bounce/buy-pressure read.
+      const recent5       = c5.slice(-2);
+      const priceChange5m = pctChange(recent5, recent5.length);
+      const buys5m        = sumB(recent5);
+      const sells5m       = sumS(recent5);
+      const vol5m         = sumV(recent5) * solUsd;
+
+      // ── Data-quality metadata (feed honesty) — freshness, true single-candle 5m, confidence.
+      const lastCandle   = c5[c5.length - 1];
+      const lastTsRaw    = lastCandle?.t ?? null;
+      const lastTsMs     = lastTsRaw == null ? null : (lastTsRaw > 2e10 ? lastTsRaw : lastTsRaw * 1000);
+      const CANDLE_MS    = 300_000; // 5m window
+      // Age from the candle's CLOSE (t + window), not its start.
+      const dataAgeSec   = lastTsMs == null ? null : Math.max(0, Math.round((Date.now() - (lastTsMs + CANDLE_MS)) / 1000));
+      const pc5mTrue     = lastCandle && lastCandle.o > 0 ? ((lastCandle.c - lastCandle.o) / lastCandle.o) * 100 : 0;
+      const txns5mTrue   = (lastCandle?.b ?? 0) + (lastCandle?.s ?? 0);
+      const totalTxns5m  = buys5m + sells5m;
+      const STALE_AGE_SEC = 600; // >10 min since a candle closed ⇒ stale, not live
+      const MIN_LIVE_TXNS = 4;   // matches scoring.minActivityTxns5m default
+      let confidence = 'high';
+      if (dataAgeSec != null && dataAgeSec > STALE_AGE_SEC) confidence = 'stale';
+      else if (totalTxns5m < MIN_LIVE_TXNS)                 confidence = 'thin';
+
+      // Sustained-reversal confirmation: a real turn HOLDS across candles (higher low + advancing close).
+      let sustainedBounce = false;
+      if (c5.length >= 2) {
+        const prevC = c5[c5.length - 2];
+        const currC = c5[c5.length - 1];
+        sustainedBounce = currC.l >= prevC.l * 0.99 && currC.c >= prevC.c * 0.995;
+      }
+
+      // S2 — fresh 1m bounce read (the turn is happening NOW, not ~10 min ago).
+      let priceChange1m = null, bounceFresh = null;
+      if (cm.length >= 2) {
+        priceChange1m = +pctChange(cm.slice(-2), 2).toFixed(4);
+        const pm = cm[cm.length - 2], cc = cm[cm.length - 1];
+        bounceFresh = cc.c >= pm.c * 0.999 && cc.c >= cc.o * 0.995;
+      }
+
+      const priceChange1h  = pctChange(c1, 2);                       // most recent ~1h
+      const priceChange6h  = pctChange(c1, 6);                       // aggregate of 1h candles
+      const priceChange24h = cd.length ? pctChange(cd, 2) : pctChange(c1, 24);
+
+      // Corrupt-candle skip — a bad OHLCV point can produce thousands-of-percent moves.
+      if (Math.abs(priceChange5m) > 200 || Math.abs(priceChange1h) > 200) return null;
+
+      const volume1h       = sumV(c1) * solUsd;
+      const volume24h      = (cd.length ? sumV(cd) : sumV(c1)) * solUsd;
+      const buys1h         = sumB(c1);
+      const sells1h        = sumS(c1);
+
+      const solReserve    = priceMap[mint]?.solReserve ?? 0;
+      const liquidityUsd  = solReserve > 0 ? solReserve * 2 * solUsd : 0;
+      if (liquidityUsd > 0 && liquidityUsd < minLiquidity) return null;
+
+      return {
         mint,
-        recentTxns,
-        recentVolSol: parseFloat(recentVolSol.toFixed(4)),
-        ageMin: parseFloat(((now - newest.t) / 60_000).toFixed(1)),
-      });
-    }
-    // Rank by recent txn count, then recent SOL volume.
-    active.sort((a, b) => b.recentTxns - a.recentTxns || b.recentVolSol - a.recentVolSol);
-    _activeCache   = active;
-    _activeCacheTs = now;
+        symbol:         '?',
+        name:           '?',
+        price:          priceMap[mint]?.priceSol ?? 0,
+        priceChange5m:  parseFloat(priceChange5m.toFixed(4)),
+        priceChange1h:  parseFloat(priceChange1h.toFixed(4)),
+        priceChange6h:  parseFloat(priceChange6h.toFixed(4)),
+        priceChange24h: parseFloat(priceChange24h.toFixed(4)),
+        liquidity:      liquidityUsd,
+        volume5m:       vol5m,
+        volume1h:       volume1h,
+        volume24h:      volume24h,
+        txns5m:  { buys: buys5m, sells: sells5m },
+        txns1h:  { buys: buys1h, sells: sells1h },
+        dataAgeSec,
+        stale:          confidence === 'stale',
+        pc5mTrue:       parseFloat(pc5mTrue.toFixed(4)),
+        txns5mTrue,
+        confidence,
+        sustainedBounce,
+        priceChange1m,   // S2 — fresh 1m bounce magnitude (null if 1m data sparse)
+        bounceFresh,     // S2 — is the turn still advancing in the last 1m (null if sparse)
+        fdv:     0,
+        pairAddress:    null,
+        verdict:        null,
+        rugRisk:        null,
+      };
+    } catch { return null; }
+  }))).filter(Boolean);
 
-    const out = active.filter(t => t.recentTxns >= minTxns).slice(0, limit);
-    res.json({ tokens: out, count: out.length, total: active.length, solUsd: solPrice.getSolPrice(), cached: false });
+  return candidates;
+}
+
+app.get('/scan', async (req, res) => {
+  const limit        = Math.min(Math.max(parseInt(req.query.limit ?? '30', 10), 1), 100);
+  const minLiquidity = Math.max(Number(req.query.minLiquidity ?? '5000') || 0, 0);
+  const seedMints    = (req.query.seed ?? '').split(',').map(s => s.trim()).filter(s => s.length >= 32).slice(0, 80);
+  try {
+    const candidates = await buildScanCandidates({ limit, minLiquidity, seedMints });
+    res.json({ candidates, count: candidates.length, solUsd: solPrice.getSolPrice(), source: 'price-feed-scan' });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message, candidates: [], source: 'price-feed-scan' });
   }
 });
 
